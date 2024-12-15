@@ -1,45 +1,47 @@
-#define BLYNK_TEMPLATE_ID "TMPL6nwHdQPte"
-#define BLYNK_TEMPLATE_NAME "SMART PLANT MONITORING"
-#define BLYNK_AUTH_TOKEN "B4J7MbIH39GTAEGycp6kqxpALmt2kkDT"
-
-#define BLYNK_PRINT Serial
+#define BLYNK_TEMPLATE_ID "TMPL6qzgyOInR"
+#define BLYNK_TEMPLATE_NAME "Smart Plant Monitoring System"
+#define BLYNK_AUTH_TOKEN "19V-e_JkWFzQlcZD_TK50LCfjdW-7f92"
 
 #include <SPI.h>
 #include <WiFi.h>
 #include <BlynkSimpleWifi.h>
 #include <Servo.h>
+#include <TimeLib.h>
+#include <EEPROM.h>
 
 // WiFi credentials
-char ssid[] = "Redmi 12C66"; 
-char pass[] = "123456789066";
+char ssid[] = "HUAWEI-2.4G-6Mg3"; 
+char pass[] = "gZGGB44Y";
 
-// Servo motor declarations
+// Servo setup
 Servo myservo1;  // First servo motor
 Servo myservo2;  // Second servo motor
 
-// LDR sensor
-int ldrPin = A0;         // Pin for the photoresistor
+// LDR setup
+int ldrPin = A0;  // Pin where the photoresistor is connected
 int lightThreshold = 800;  // Threshold value for detecting sunlight
-unsigned long lastMoveTime = 0;  // Track the last time the servos moved (30-second timer)
-unsigned long last60SecMoveTime = 0;  // Track the last time for the 60-second timer
-unsigned long accumulatedTime30Sec = 0;  // Accumulated time for the 30-second timer
-unsigned long accumulatedTime60Sec = 0;  // Accumulated time for the 60-second timer
-unsigned long timerDuration30Sec = 15000;  // 15 seconds in milliseconds
-unsigned long timerDuration60Sec = 30000;  // 30 seconds in milliseconds
-bool at130Degrees = false;  // Tracks if servos are at 130 degrees
-bool counting30Sec = false;  // Tracks if we are counting the 30-second timer
-bool pauseCounting30Sec = false;  // Flag to pause the 30-second timer when sunlight is lost
-unsigned long pausedTime30Sec = 0;  // Tracks paused time for the 30-second timer
 
+// Moisture sensor
 // Moisture sensor
 int moisturePin = A1;  // Analog input pin for the moisture sensor
 int moistureValue = 0;  // Store the moisture level
-int moistureThreshold = 700;  // Threshold value for dry soil
+int moistureThreshold = 800;  // Threshold value for dry soil
 int relayPin = 3;  // Relay pin to control the water pump
+
+// Timing logic
+unsigned long lastOpenTime = 0;  // Tracks when the servos were last opened
+unsigned long sunlightAccumulatedMillis = 0;  // Accumulated sunlight exposure time
+const unsigned long sunlightLimitMillis = 15 * 60 * 1000;  // 15 seconds for testing
+bool exposureLimitReached = false;  // Flag to track if the daily limit is reached
+int lastDay = 0;  // Tracks the last day for daily reset
+
+// EEPROM Addresses
+#define EXPOSURE_LIMIT_REACHED_ADDR 0
+#define ACCUMULATED_MILLIS_ADDR 1
+#define LAST_DAY_ADDR 5
 
 // Blynk Virtual Pins
 #define VIRTUAL_PIN_MOISTURE V1  // Moisture status
-#define VIRTUAL_PIN_ROOF V2      // Roof status
 #define VIRTUAL_PIN_LDR V4   //Chart
 
 // For sending Blynk notifications
@@ -49,7 +51,7 @@ bool roofCloseTrigger = false;
 void setup() {
   Serial.begin(9600);
 
-  // Attempt Wi-Fi connection with a timeout
+ // Attempt Wi-Fi connection with a timeout
   WiFi.begin(ssid, pass);
   unsigned long wifiTimeout = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiTimeout < 10000) {  // 10-second timeout
@@ -63,52 +65,80 @@ void setup() {
     Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
   } else {
     Serial.println("WiFi connection failed. Running offline.");
-  }
+  } 
+
+  // Reset EEPROM (you can remove this line after testing)
+  resetEEPROM();
+
+  // Initialize EEPROM
+  exposureLimitReached = EEPROM.read(EXPOSURE_LIMIT_REACHED_ADDR);
+  sunlightAccumulatedMillis = EEPROM.read(ACCUMULATED_MILLIS_ADDR) * 1000UL; // Stored in seconds
+  lastDay = EEPROM.read(LAST_DAY_ADDR);
+
+  Serial.println("Restored values from EEPROM:");
+  Serial.print("Exposure Limit Reached: ");
+  Serial.println(exposureLimitReached);
+  Serial.print("Accumulated Millis: ");
+  Serial.println(sunlightAccumulatedMillis);
+  Serial.print("Last Day: ");
+  Serial.println(lastDay);
 
   // Servo setup
   myservo1.attach(9);  // First servo on pin 9
   myservo2.attach(10); // Second servo on pin 10
 
-  // Close servo
+  // Initialize the CLOSE roof
   myservo1.write(30);
   myservo2.write(30);
 
-  // Moisture sensor setup
-  pinMode(relayPin, OUTPUT);  // Set relay pin as output
+  // Initialize the clock
+  setTime(0, 0, 0, 1, 1, 2023);  // (hour, minute, second, day, month, year)
 
-  // Initialize timers
-  lastMoveTime = millis();
-  last60SecMoveTime = millis();
-  Serial.println("System started.");
+  // Moisture and relay setup
+  pinMode(moisturePin, INPUT);  // Set moisture sensor pin as input
+  pinMode(relayPin, OUTPUT);   // Set relay pin as output
+  digitalWrite(relayPin, LOW); // Ensure pump is initially OFF
 }
 
 void loop() {
-  if (WiFi.status() == WL_CONNECTED) {
+
+    if (WiFi.status() == WL_CONNECTED) {
     Blynk.run();  // Only run Blynk if Wi-Fi is connected
   } else {
     Serial.println("Blynk is offline. Continuing offline functionality.");
   }
 
-  handleLDR();
+  time_t currentTime = now();
+  int currentDay = day(currentTime);
+
+  // Check for a new day to reset exposure tracking
+  if (currentDay != lastDay) {
+    resetDailyExposure();
+    lastDay = currentDay;
+
+    // Save the new day in EEPROM
+    EEPROM.update(LAST_DAY_ADDR, lastDay);
+  }
+
+  handleSunlightExposure();
   handleMoisture();
-  handleTimers();
-  updateRoofStatus();
 }
 
-void handleLDR() {
-  int ldrValue = analogRead(ldrPin);
+void handleSunlightExposure() {
+  int ldrValue = analogRead(ldrPin);  // Read the value from the photoresistor
   Serial.print("LDR Value: ");
   Serial.println(ldrValue);
 Blynk.virtualWrite(VIRTUAL_PIN_LDR, ldrValue);
+  unsigned long currentMillis = millis();
 
-  if (ldrValue > lightThreshold && !at130Degrees && !counting30Sec) {
-    myservo1.write(130);
-    myservo2.write(130);
-    lastMoveTime = millis();
-    at130Degrees = true;
-    counting30Sec = true;
-    pausedTime30Sec = 0;
-    Serial.println("Sunlight detected. Moving to 130 degrees, starting 30-second count.");
+  // If sunlight is detected and the daily limit is not yet reached
+  if (ldrValue > lightThreshold && !exposureLimitReached) {
+    Serial.println("Sunlight detected, attempting to open roof...");
+    if (lastOpenTime == 0) {
+    myservo1.write(140);
+    myservo2.write(140);
+      lastOpenTime = currentMillis;
+      Serial.println("Roof opened.");
     if (!roofOpenTrigger) {
       if (WiFi.status() == WL_CONNECTED) {
         Blynk.logEvent("roof_status", "Roof is OPEN: sunlight detected");
@@ -116,20 +146,25 @@ Blynk.virtualWrite(VIRTUAL_PIN_LDR, ldrValue);
       roofOpenTrigger = true;
       roofCloseTrigger = false;
     }
-  }
+    }
 
-  if (at130Degrees && counting30Sec && !pauseCounting30Sec) {
-    unsigned long currentMillis = millis();
-    accumulatedTime30Sec = currentMillis - lastMoveTime;
-    Serial.print("Accumulated time for 30 seconds: ");
-    Serial.println(accumulatedTime30Sec / 1000);
+    if (lastOpenTime > 0) {
+      unsigned long elapsedTime = currentMillis - lastOpenTime;
+      Serial.print("Elapsed Time: ");
+      Serial.println(elapsedTime);
 
-    if (accumulatedTime30Sec >= timerDuration30Sec) {
-      myservo1.write(30);
-      myservo2.write(30);
-      Serial.println("30 seconds passed, moving to 30 degrees (closed).");
-      counting30Sec = false;
-      pauseCounting30Sec = false;
+      sunlightAccumulatedMillis += elapsedTime;
+      lastOpenTime = currentMillis;
+
+      if (sunlightAccumulatedMillis >= sunlightLimitMillis) {
+        exposureLimitReached = true;
+        closeRoof();
+
+        EEPROM.update(EXPOSURE_LIMIT_REACHED_ADDR, exposureLimitReached);
+        EEPROM.update(ACCUMULATED_MILLIS_ADDR, sunlightAccumulatedMillis / 1000UL);
+
+        Serial.println("Daily sunlight limit reached. Roof closed.");
+
       if (!roofCloseTrigger) {
         if (WiFi.status() == WL_CONNECTED) {
           Blynk.logEvent("roof_status", "Roof is CLOSED: sunlight requirement met");
@@ -137,19 +172,16 @@ Blynk.virtualWrite(VIRTUAL_PIN_LDR, ldrValue);
         roofCloseTrigger = true;
         roofOpenTrigger = false;
       }
+      }
     }
-  }
-
-  if (ldrValue <= lightThreshold && at130Degrees) {
-    myservo1.write(30);
-    myservo2.write(30);
-    if (counting30Sec) {
-      pauseCounting30Sec = true;
-      pausedTime30Sec = millis() - lastMoveTime;
-      counting30Sec = false;
-      Serial.println("No sunlight detected, moving to 30 degrees and pausing 30-second count.");
+  } else {
+    // If no sunlight is detected, close the roof if it was open
+    if (lastOpenTime > 0) {
+      closeRoof();
+      lastOpenTime = 0;
+      Serial.println("No sunlight detected. Roof closed.");
     }
-    if (!roofCloseTrigger) {
+   if (!roofCloseTrigger) {
       if (WiFi.status() == WL_CONNECTED) {
         Blynk.logEvent("roof_status", "Roof is CLOSED: no sunlight detected");
       }
@@ -158,51 +190,24 @@ Blynk.virtualWrite(VIRTUAL_PIN_LDR, ldrValue);
     }
   }
 
-  if (ldrValue > lightThreshold && pauseCounting30Sec) {
-    lastMoveTime = millis() - pausedTime30Sec;
-    counting30Sec = true;
-    pauseCounting30Sec = false;
-    myservo1.write(130);
-    myservo2.write(130);
-    at130Degrees = true;
-    Serial.println("Sunlight detected again. Resuming 30-second count and moving to 130 degrees.");
-    if (!roofOpenTrigger) {
-      if (WiFi.status() == WL_CONNECTED) {
-        Blynk.logEvent("roof_status", "Roof is OPEN: sunlight detected");
-      }
-      roofOpenTrigger = true;
-      roofCloseTrigger = false;
-    }
-  }
+  delay(100);
 }
 
-void handleTimers() {
-  unsigned long currentMillis = millis();
-  accumulatedTime60Sec = currentMillis - last60SecMoveTime;
-  Serial.print("Accumulated time for 60 seconds: ");
-  Serial.println(accumulatedTime60Sec / 1000);
-
-  if (accumulatedTime60Sec >= timerDuration60Sec) {
-    accumulatedTime60Sec = 0;
-    last60SecMoveTime = millis();
-    at130Degrees = false;
-    counting30Sec = false;
-    Serial.println("60 seconds completed. System reset, starting new cycle.");
-  }
+void closeRoof() {
+  myservo1.write(30);
+  myservo2.write(30);
+  Serial.println("Roof closed.");
 }
 
-void updateRoofStatus() {
-  if (at130Degrees) {
-    if (WiFi.status() == WL_CONNECTED) {
-      Blynk.virtualWrite(VIRTUAL_PIN_ROOF, "THE ROOF IS OPEN");
-    }
-    Serial.println("The roof is open. Status sent to Blynk.");
-  } else {
-    if (WiFi.status() == WL_CONNECTED) {
-      Blynk.virtualWrite(VIRTUAL_PIN_ROOF, "THE ROOF IS CLOSED");
-    }
-    Serial.println("The roof is closed. Status sent to Blynk.");
-  }
+void resetDailyExposure() {
+  sunlightAccumulatedMillis = 0;
+  exposureLimitReached = false;
+
+  // Reset values in EEPROM
+  EEPROM.update(EXPOSURE_LIMIT_REACHED_ADDR, exposureLimitReached);
+  EEPROM.update(ACCUMULATED_MILLIS_ADDR, sunlightAccumulatedMillis / 1000UL);
+
+  Serial.println("New day detected. Exposure limit reset.");
 }
 
 void handleMoisture() {
@@ -215,14 +220,22 @@ void handleMoisture() {
     if (WiFi.status() == WL_CONNECTED) {
       Blynk.virtualWrite(VIRTUAL_PIN_MOISTURE, "THE PLANT HAS ENOUGH WATER. PUMP IS OFF");
     }
-    Serial.println("Soil is dry, pump ON. Status sent to Blynk.");
+    Serial.println("Soil is moist, pump OFF. Status sent to Blynk.");
   } else {  // If the soil is moist (above or equal to threshold)
     digitalWrite(relayPin, LOW);  // Turn off the pump
     if (WiFi.status() == WL_CONNECTED) {
       Blynk.virtualWrite(VIRTUAL_PIN_MOISTURE, "THE PLANT IS DRY. PUMP IS ON");
     }
-    Serial.println("Soil is moist, pump OFF. Status sent to Blynk.");
+    Serial.println("Soil is dry, pump ON. Status sent to Blynk.");
   }
 
   delay(1000);
+}
+// Function to reset EEPROM
+void resetEEPROM() {
+  // Reset the EEPROM to default values
+  EEPROM.write(EXPOSURE_LIMIT_REACHED_ADDR, 0);
+  EEPROM.write(ACCUMULATED_MILLIS_ADDR, 0);
+  EEPROM.write(LAST_DAY_ADDR, 0);
+  Serial.println("EEPROM has been reset.");
 }
